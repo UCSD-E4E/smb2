@@ -139,7 +139,8 @@ Table, rationale, and the empirical evidence: `src/name.rs` module docs. What ma
 - **Read compound**: CREATE + READ + CLOSE (3 ops, 1 round-trip). Default for `read_file`.
 - **Write compound**: CREATE + WRITE + FLUSH + CLOSE (4 ops, 1 round-trip). Default for `write_file`.
 - **Delete compound**: CREATE (DELETE_ON_CLOSE) + CLOSE (2 ops, 1 round-trip). Default for `delete_file` / `delete_directory`.
-- **Rename compound**: CREATE + SET_INFO + CLOSE (3 ops, 1 round-trip). Default for `rename`.
+- **Rename compound**: CREATE + SET_INFO + CLOSE (3 ops, 1 round-trip). Default for `rename`. `rename_with_options` sends the server the `ReplaceIfExists` flag rather than emulating a replace with delete-then-rename, so the destination name never stops resolving.
+- **Set-length compound**: CREATE + SET_INFO (FileEndOfFileInformation) + CLOSE (3 ops, 1 round-trip). Default for `set_end_of_file`. Truncating is a round trip whatever the file weighs, since the dropped bytes are never read.
 - **Stat compound**: CREATE + QUERY_INFO (basic) + QUERY_INFO (standard) + CLOSE (4 ops, 1 round-trip). Default for `stat`.
 - **Fs-info compound**: CREATE + QUERY_INFO (FileFsFullSizeInformation) + CLOSE (3 ops, 1 round-trip). Default for `fs_info`.
 - If CREATE succeeds but a later op fails, the client issues a standalone CLOSE to avoid leaking the handle.

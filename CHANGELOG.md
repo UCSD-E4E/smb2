@@ -5,6 +5,13 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`rename_with_options` asks the server to replace the destination, instead of leaving callers to fake it.** `FileRenameInformation` carries a `ReplaceIfExists` flag and the crate hardcoded it to `false`, so renaming onto a name that exists returned `STATUS_OBJECT_NAME_COLLISION` and every "publish under the final name" workflow had to improvise: delete then rename, or move the old file aside, rename, and delete the backup. Both leave a window where neither the old file nor the new one is at the name, and a client that dies mid-sequence leaves the share in a state only a human can sort out. `RenameOptions { replace_if_exists: true }` hands the swap to the server, which does it as one operation. `rename` is unchanged and still refuses a taken name.
+- **`set_end_of_file` truncates or extends a file in one round trip.** `FileEndOfFileInformation` (MS-FSCC 2.4.13, level 20) was the one set-only class the SET_INFO path never sent, so shortening a file meant reading it, cutting the tail off locally, and writing the whole thing back: 11 GB of traffic to take a 6 GB file down to 5 GB, and a window where the file is neither length. Now it is a CREATE + SET_INFO + CLOSE compound whose cost does not depend on the file's size, because the bytes being dropped are never read. Extending works the same way and lets the filesystem decide whether the gap is sparse.
+
 ## [0.18.1] - 2026-08-08
 
 ### Fixed
