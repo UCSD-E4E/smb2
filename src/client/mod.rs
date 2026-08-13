@@ -37,7 +37,7 @@ pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, FileWriter, Progress};
-pub use tree::{DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree};
+pub use tree::{DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, RenameOptions, Tree};
 pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
 // Re-export high-level client types.
@@ -937,15 +937,51 @@ impl SmbClient {
 
     /// Rename a file or directory on the given share.
     pub async fn rename(&mut self, tree: &mut Tree, from: &str, to: &str) -> Result<()> {
+        self.rename_with_options(tree, from, to, RenameOptions::default())
+            .await
+    }
+
+    /// Rename, saying what should happen when the destination name is taken.
+    ///
+    /// See [`Tree::rename_with_options`]. With
+    /// [`RenameOptions::replace_if_exists`], the server performs the swap, so
+    /// the destination never stops resolving and there is nothing to unwind if
+    /// the client dies partway.
+    pub async fn rename_with_options(
+        &mut self,
+        tree: &mut Tree,
+        from: &str,
+        to: &str,
+        options: RenameOptions,
+    ) -> Result<()> {
         let result = {
             let conn = self.connection_for_tree(tree);
-            tree.rename(conn, from, to).await
+            tree.rename_with_options(conn, from, to, options).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, from).await?;
                 let conn = self.connection_for_tree(tree);
-                tree.rename(conn, &new_path, to).await
+                tree.rename_with_options(conn, &new_path, to, options).await
+            }
+            other => other,
+        }
+    }
+
+    /// Set a file's length: truncate it, or extend it with zeroes.
+    ///
+    /// See [`Tree::set_end_of_file`]. One round trip, whatever the file's size
+    /// — the bytes being dropped are never read and never rewritten.
+    pub async fn set_end_of_file(&mut self, tree: &mut Tree, path: &str, size: u64) -> Result<()> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.set_end_of_file(conn, path, size).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.set_end_of_file(conn, &new_path, size).await
             }
             other => other,
         }

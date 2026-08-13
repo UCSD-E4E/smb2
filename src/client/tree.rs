@@ -96,6 +96,11 @@ const FILE_RENAME_INFORMATION: u8 = 10;
 /// FileDispositionInformation class for SET_INFO (MS-FSCC 2.4.11).
 const FILE_DISPOSITION_INFORMATION: u8 = 13;
 
+/// FileEndOfFileInformation class for SET_INFO (MS-FSCC 2.4.13, level 20,
+/// set-only). Its payload is one 64-bit signed offset: the position of the
+/// byte after the last byte of the file.
+const FILE_END_OF_FILE_INFORMATION: u8 = 20;
+
 /// FileFsFullSizeInformation class for QUERY_INFO (MS-FSCC 2.5.4).
 const FILE_FS_FULL_SIZE_INFORMATION: u8 = 7;
 
@@ -208,6 +213,18 @@ pub struct FsInfo {
     pub bytes_per_sector: u32,
     /// Sectors per allocation unit (cluster).
     pub sectors_per_unit: u32,
+}
+
+/// What a rename should do about a destination name that already exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenameOptions {
+    /// Replace the destination instead of failing.
+    ///
+    /// The server does the swap, so the destination name never stops
+    /// resolving and a client that dies mid-rename leaves nothing to clean
+    /// up. Default is `false`: a taken name fails with
+    /// `OBJECT_NAME_COLLISION` and nothing moves.
+    pub replace_if_exists: bool,
 }
 
 /// A connection to a specific share (tree connect).
@@ -1075,12 +1092,34 @@ impl Tree {
     /// Sends CREATE + SET_INFO (FileRenameInformation) + CLOSE as a single
     /// compound message.
     pub async fn rename(&self, conn: &mut Connection, from: &str, to: &str) -> Result<()> {
+        self.rename_with_options(conn, from, to, RenameOptions::default())
+            .await
+    }
+
+    /// Rename, saying what should happen when the destination name is taken.
+    ///
+    /// With [`RenameOptions::replace_if_exists`] set, the server replaces the
+    /// destination as part of the same operation: there is no moment when
+    /// neither name resolves, and nothing to unwind if the client dies
+    /// mid-swap. That is the difference between publishing a file under its
+    /// final name and hoping a delete-then-rename finishes.
+    ///
+    /// Without it (the default), a taken name is
+    /// [`NtStatus::OBJECT_NAME_COLLISION`] and nothing changes.
+    pub async fn rename_with_options(
+        &self,
+        conn: &mut Connection,
+        from: &str,
+        to: &str,
+        options: RenameOptions,
+    ) -> Result<()> {
         let from_normalized = self.format_path(from);
         let to_normalized = normalize_path(to);
         trace!(
-            "tree: rename (compound) from={} to={}",
+            "tree: rename (compound) from={} to={} replace_if_exists={}",
             from_normalized,
-            to_normalized
+            to_normalized,
+            options.replace_if_exists
         );
 
         // Build CREATE request with DELETE access (required for rename).
@@ -1108,7 +1147,7 @@ impl Tree {
             file_info_class: FILE_RENAME_INFORMATION,
             additional_information: 0,
             file_id: FileId::SENTINEL,
-            buffer: build_rename_info_buffer(&to_normalized),
+            buffer: build_rename_info_buffer(&to_normalized, options.replace_if_exists),
         };
 
         // Build CLOSE request with sentinel FileId.
@@ -1181,6 +1220,127 @@ impl Tree {
             "tree: renamed from={} to={}",
             from_normalized, to_normalized
         );
+        Ok(())
+    }
+
+    /// Set a file's length: truncate it, or extend it with zeroes.
+    ///
+    /// One CREATE + SET_INFO + CLOSE compound, so shortening a 6 GB file is a
+    /// round trip rather than a rewrite. Extending is equally cheap on the
+    /// wire; the server materialises the gap, which on a sparse filesystem
+    /// costs nothing until something writes there.
+    ///
+    /// The file must exist. `FileEndOfFileInformation` is set-only and takes a
+    /// signed offset (MS-FSCC 2.4.13), so `size` is the position of the byte
+    /// after the last byte the caller wants to keep.
+    pub async fn set_end_of_file(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        size: u64,
+    ) -> Result<()> {
+        let normalized = self.format_path(path);
+        trace!(
+            "tree: set_end_of_file (compound) path={} size={}",
+            normalized,
+            size
+        );
+
+        // FILE_WRITE_DATA is what the server checks for this class; a handle
+        // opened only for attributes gets STATUS_ACCESS_DENIED.
+        let create_req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_WRITE_DATA | FileAccessMask::FILE_READ_ATTRIBUTES,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            // Open, never create: setting the length of a file that is not
+            // there is a mistake worth reporting, not a way to make one.
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: 0,
+            name: normalized.clone(),
+            create_contexts: vec![],
+        };
+
+        let setinfo_req = SetInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: FILE_END_OF_FILE_INFORMATION,
+            additional_information: 0,
+            file_id: FileId::SENTINEL,
+            buffer: build_end_of_file_info_buffer(size),
+        };
+
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
+
+        let ops = [
+            CompoundOp {
+                command: Command::Create,
+                body: &create_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::SetInfo,
+                body: &setinfo_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Close,
+                body: &close_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+        ];
+
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
+
+        let create_header = &responses[0].header;
+        let create_body = &responses[0].body;
+        let setinfo_header = &responses[1].header;
+        let close_header = &responses[2].header;
+
+        // CREATE failed, so the rest cascaded and there is no handle to close.
+        if create_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: create_header.status,
+                command: Command::Create,
+            });
+        }
+
+        // CREATE succeeded but SET_INFO did, so CLOSE cascaded with it: the
+        // handle is open and only a standalone CLOSE will release it.
+        if setinfo_header.status != NtStatus::SUCCESS {
+            let mut cursor = ReadCursor::new(create_body);
+            let create_resp = CreateResponse::unpack(&mut cursor)?;
+            warn!(
+                "tree: compound SET_INFO (end of file) failed ({:?}), issuing standalone CLOSE",
+                setinfo_header.status
+            );
+            let _ = self.close_handle(conn, create_resp.file_id).await;
+            return Err(Error::Protocol {
+                status: setinfo_header.status,
+                command: Command::SetInfo,
+            });
+        }
+
+        if close_header.status != NtStatus::SUCCESS {
+            debug!(
+                "tree: compound CLOSE returned {:?} (non-fatal, length already set)",
+                close_header.status,
+            );
+        }
+
+        debug!("tree: set end of file path={} size={}", normalized, size);
         Ok(())
     }
 
@@ -3100,12 +3260,12 @@ impl Tree {
 }
 
 /// Build a FileRenameInformation buffer (MS-FSCC 2.4.34.2).
-fn build_rename_info_buffer(new_name: &str) -> Vec<u8> {
+fn build_rename_info_buffer(new_name: &str, replace_if_exists: bool) -> Vec<u8> {
     let name_u16: Vec<u16> = new_name.encode_utf16().collect();
     let name_byte_len = name_u16.len() * 2;
 
     let mut buf = Vec::with_capacity(20 + name_byte_len);
-    buf.push(0); // ReplaceIfExists = false
+    buf.push(u8::from(replace_if_exists)); // ReplaceIfExists
     buf.extend_from_slice(&[0u8; 7]); // Reserved
     buf.extend_from_slice(&0u64.to_le_bytes()); // RootDirectory
     buf.extend_from_slice(&(name_byte_len as u32).to_le_bytes()); // FileNameLength
@@ -3113,6 +3273,14 @@ fn build_rename_info_buffer(new_name: &str) -> Vec<u8> {
         buf.extend_from_slice(&u.to_le_bytes());
     }
     buf
+}
+
+/// Build a FILE_END_OF_FILE_INFORMATION buffer (MS-FSCC 2.4.13).
+///
+/// One field: a 64-bit signed offset, little endian. The spec requires it to
+/// be non-negative, which every `u64` a caller can pass already is.
+fn build_end_of_file_info_buffer(size: u64) -> Vec<u8> {
+    (size as i64).to_le_bytes().to_vec()
 }
 
 /// Turn a caller's path into the wire path SMB2 wants.
@@ -6840,5 +7008,103 @@ mod tests {
         handle_b.await.expect("task b panicked");
 
         assert_eq!(mock.sent_count(), 6); // 2 CREATE + 2 READ + 2 CLOSE
+    }
+
+    #[test]
+    fn rename_buffer_defaults_to_refusing_a_taken_name() {
+        let buf = build_rename_info_buffer("new.txt", false);
+        assert_eq!(buf[0], 0, "ReplaceIfExists");
+        // Reserved(7) + RootDirectory(8) + FileNameLength(4), then UTF-16LE.
+        assert_eq!(&buf[1..8], &[0u8; 7]);
+        assert_eq!(&buf[8..16], &0u64.to_le_bytes());
+        assert_eq!(&buf[16..20], &(("new.txt".len() * 2) as u32).to_le_bytes());
+        assert_eq!(&buf[20..], b"n\0e\0w\0.\0t\0x\0t\0");
+    }
+
+    #[test]
+    fn rename_buffer_asks_the_server_to_replace() {
+        // The whole point: the swap happens server-side, so the destination
+        // name never stops resolving.
+        let buf = build_rename_info_buffer("new.txt", true);
+        assert_eq!(buf[0], 1, "ReplaceIfExists");
+        // Nothing else about the layout changes.
+        assert_eq!(
+            &buf[1..],
+            &build_rename_info_buffer("new.txt", false)[1..],
+            "only the flag differs"
+        );
+    }
+
+    #[test]
+    fn end_of_file_buffer_is_one_little_endian_offset() {
+        // MS-FSCC 2.4.13: a single 64-bit signed offset, nothing else.
+        assert_eq!(build_end_of_file_info_buffer(0), vec![0u8; 8]);
+        assert_eq!(
+            build_end_of_file_info_buffer(1),
+            vec![1, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let big = 6 * 1024 * 1024 * 1024u64; // past 32 bits, where a truncated field would show
+        assert_eq!(build_end_of_file_info_buffer(big), big.to_le_bytes());
+    }
+
+    #[tokio::test]
+    async fn set_end_of_file_create_failure_returns_error() {
+        let mock = Arc::new(MockTransport::new());
+
+        let mut create_hdr = Header::new_request(Command::Create);
+        create_hdr.flags.set_response();
+        create_hdr.credits = 32;
+        create_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let create_resp = pack_message(
+            &create_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let mut setinfo_hdr = Header::new_request(Command::SetInfo);
+        setinfo_hdr.flags.set_response();
+        setinfo_hdr.credits = 32;
+        setinfo_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let setinfo_resp = pack_message(
+            &setinfo_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let close_resp = pack_message(
+            &close_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let frame = build_compound_response_frame(&[create_resp, setinfo_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let result = tree.set_end_of_file(&mut conn, "missing.bin", 1024).await;
+        assert_eq!(
+            result.unwrap_err().status(),
+            Some(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+        // Nothing was opened, so nothing needs closing.
+        assert_eq!(mock.sent_count(), 1);
     }
 }
