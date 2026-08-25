@@ -2,6 +2,8 @@
 
 Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provides convenience methods for file operations.
 
+Two ways in. `SmbClient::connect` dials TCP and does the rest; `SmbClient::from_connection` takes a `Connection` the caller built with `Connection::from_transport` and does everything else — the same negotiate and session setup, without the dial. That is what lets the client run over a transport this crate has never heard of, and it is what the mock-backed tests use, so the consumer path and the test path are the same path.
+
 ## Key files
 
 | File | Purpose |
@@ -264,6 +266,7 @@ Full rationale on `Connection::reconnect_if_needed` and `ReconnectPolicy`.
 **A revival happens in place, under the existing `Arc<Inner>`.** `FileWriter`, `FileReader`, `Watcher`, and every pipelined task own a `Connection` clone; minting a new `Connection` would leave all of them permanently dead and force the consumer to rebuild the world. ❌ Don't "simplify" this back to returning a fresh `Connection`.
 
 - **Armed by the consumer, never assumed.** `Connection::set_reviver` supplies the two things this crate deliberately doesn't keep: an address and credentials. `ClientConfig::auto_reconnect` installs one built from the config. With none installed a dead connection reports `Error::Disconnected` and stays dead.
+- **`from_connection` refuses `auto_reconnect` outright.** The reviver that flag installs dials `config.addr` over TCP, and a supplied connection did not come from there. Ignored, the consumer believes in a recovery that cannot happen; honoured, a revival silently moves the session off the transport they chose — onto the open internet, if what they supplied was a tunnel. So it is an error, and a consumer who wants revival on their own transport installs a reviver that knows how to reopen it.
 - **Written for a stampede.** A 32-deep pipeline discovers the same dead session 32 times at once; `reconnect_if_needed` dials once and everyone else returns off the same attempt (`revive_lock` + the `revivals` counter, which is bumped only on success so the double-check can't see a half-built session).
 - **Every bound lives in `ReconnectPolicy`.** The wall-clock budget wraps the ENTIRE revival, not each attempt: a per-attempt timeout multiplies by the attempt count, and an attempt that parks forever never reaches the second one. A failed revival's verdict stands for `failure_cooldown`, or each caller pays the full budget in turn (32 × 60 s is the unbounded hang again).
 - **`install_transport` erases the dead session completely** and in a fixed order: tear down (which sets `disconnected` under the waiters lock), reset, rebuild, clear `disconnected` LAST. ❌ Nothing may carry over — a stale credit window out-spends the new server, a stale message id makes the server drop us for a sequence gap, stale keys fail verification on every frame. `send_queue_depth` is the deliberate exception (resetting it underflows a caller mid-increment).
