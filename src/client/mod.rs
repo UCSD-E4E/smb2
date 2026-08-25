@@ -48,7 +48,7 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use log::debug;
+use log::{debug, warn};
 
 use crate::client::dfs::DfsResolver;
 use crate::error::{ErrorKind, Result};
@@ -206,6 +206,16 @@ pub struct SmbClient {
     session: std::sync::Arc<Session>,
     /// Server name of the primary connection (from `conn.server_name()`).
     primary_server: String,
+    /// Whether this client may open sockets of its own.
+    ///
+    /// True when it dialled its own connection, and false when one was handed
+    /// to it by [`SmbClient::from_connection`]. Everything that would dial —
+    /// arming the built-in reviver, following a DFS referral to another
+    /// server — asks first, because a supplied transport is a decision the
+    /// consumer made and quietly stepping off it is not ours to make. What is
+    /// on the other end of `addr` may be a different route to the same
+    /// server, a route that no longer reaches it, or the open internet.
+    may_dial: bool,
     /// Extra connections for DFS cross-server targets, keyed by server name.
     extra_connections: HashMap<String, ConnectionEntry>,
     /// DFS referral resolver with TTL-based cache.
@@ -252,6 +262,7 @@ impl SmbClient {
             conn,
             session: std::sync::Arc::new(session),
             primary_server,
+            may_dial: true,
             extra_connections: HashMap::new(),
             dfs_resolver: DfsResolver::new(),
             reconnects: AtomicU64::new(0),
@@ -274,18 +285,32 @@ impl SmbClient {
     /// connects are attributed to and what a DFS referral to another server is
     /// compared against.
     ///
-    /// # Reconnection stays with whoever owns the transport
+    /// `config.addr` must name the server even though nothing here dials it:
+    /// it becomes `primary_server`, which is what tree connects are attributed
+    /// to and what a DFS referral's UNC path is built from.
     ///
-    /// [`ClientConfig::auto_reconnect`] is **refused** here rather than
-    /// quietly ignored. The reviver it installs dials `config.addr` over TCP,
-    /// which is not where this connection came from — so armed on, say, a
-    /// tunnelled connection it either fails every revival, or succeeds and
-    /// moves the session onto a path the caller deliberately did not choose.
-    /// Neither is something to do behind their back.
+    /// A connection that has already negotiated keeps the compression it
+    /// negotiated. `config.compression` is a request made during NEGOTIATE, so
+    /// on that path it arrives too late to mean anything; a disagreement is
+    /// logged rather than pretended away.
     ///
-    /// A supplied connection is revived by a supplied reviver: build one that
-    /// knows how to reopen whatever this was, and install it with
-    /// [`Connection::set_reviver`] before or after this call.
+    /// # Nothing here will dial
+    ///
+    /// A client built this way never opens a socket of its own — not to
+    /// revive a dead session, not to follow a DFS referral to another server.
+    /// The consumer chose this transport, and what is on the other end of
+    /// `config.addr` may be a different route to the same server, a route that
+    /// no longer reaches it, or the open internet. Stepping off a tunnel is
+    /// not something to do behind a caller's back.
+    ///
+    /// So [`ClientConfig::auto_reconnect`] is honoured — it gates the client's
+    /// own recovery paths, which work perfectly well — but the reviver it
+    /// would normally install is not, because that one dials `config.addr`
+    /// over TCP. Arm revival with a reviver that knows how to reopen *this*
+    /// transport, via [`Connection::set_reviver`] before the call or
+    /// [`connection_mut`](Self::connection_mut) after it. Without one, a dead
+    /// connection reports [`Error::Disconnected`] and stays dead, which is
+    /// what this crate does for any connection with no reviver.
     ///
     /// ```no_run
     /// # use smb2::{ClientConfig, SmbClient};
@@ -305,22 +330,32 @@ impl SmbClient {
     /// [`Connection::from_transport`]: crate::client::connection::Connection::from_transport
     /// [`Connection::set_reviver`]: crate::client::connection::Connection::set_reviver
     pub async fn from_connection(config: ClientConfig, mut conn: Connection) -> Result<Self> {
-        if config.auto_reconnect {
+        if config.addr.is_empty() {
             return Err(Error::invalid_data(
-                "auto_reconnect cannot be used with a supplied connection: it dials `addr` \
-                 over TCP, which is not where this connection came from. Install a reviver \
-                 that knows how to reopen this transport with Connection::set_reviver.",
+                "config.addr must name the server even though nothing here dials it: it is \
+                 what tree connects are attributed to and what a DFS referral's UNC path is \
+                 built from, so an empty one produces a malformed path much later.",
             ));
         }
-
-        conn.set_compression_requested(config.compression);
 
         // A caller may have negotiated already — to look at the dialect before
         // committing to the server, say. A second NEGOTIATE on a live
         // connection is a protocol error, so this is a question worth asking
         // rather than an assumption worth making.
         if conn.params().is_none() {
+            conn.set_compression_requested(config.compression);
             conn.negotiate().await?;
+        } else if config.compression != conn.compression_enabled() {
+            // Compression is settled during NEGOTIATE, so on this path the
+            // config's answer has arrived too late to mean anything. Saying so
+            // beats leaving a caller believing compression is off while every
+            // frame still uses it.
+            warn!(
+                "smb_client: config asks for compression={} but the connection already \
+                 negotiated compression={}; the connection's answer stands",
+                config.compression,
+                conn.compression_enabled()
+            );
         }
 
         let session = Session::setup(
@@ -345,6 +380,7 @@ impl SmbClient {
             conn,
             session: std::sync::Arc::new(session),
             primary_server,
+            may_dial: false,
             extra_connections: HashMap::new(),
             dfs_resolver: DfsResolver::new(),
             reconnects: AtomicU64::new(0),
@@ -360,6 +396,7 @@ impl SmbClient {
             conn,
             session: std::sync::Arc::new(session),
             primary_server,
+            may_dial: true,
             extra_connections: HashMap::new(),
             dfs_resolver: DfsResolver::new(),
             reconnects: AtomicU64::new(0),
@@ -444,7 +481,20 @@ impl SmbClient {
         // An explicit reconnect works even when `auto_reconnect` is off: the
         // caller is asking for exactly this, and everything needed to do it is
         // already in the config.
+        //
+        // Everything, that is, for a connection this client dialled. For one
+        // it was handed, the reviver below would dial `addr` over TCP and
+        // bring the session back somewhere else entirely — which is the one
+        // thing a consumer who supplied a transport is entitled to assume will
+        // not happen.
         if !self.conn.can_reconnect() {
+            if !self.may_dial {
+                return Err(Error::invalid_data(
+                    "this client was built on a supplied connection, so it will not dial \
+                     `addr` to bring one back. Install a reviver that knows how to reopen \
+                     that transport: Connection::set_reviver, via connection_mut().",
+                ));
+            }
             self.conn
                 .set_reviver(Some(std::sync::Arc::new(ClientReviver::from_config(
                     &self.config,
@@ -686,6 +736,18 @@ impl SmbClient {
         }
         if self.extra_connections.contains_key(target_addr) {
             return Ok(()); // Already in pool.
+        }
+
+        // A referral to another server needs a second connection, and the only
+        // way this crate knows to make one is TCP to the address in the
+        // referral. On a supplied transport that is the same step off it that
+        // reviving would be, reached by a different road.
+        if !self.may_dial {
+            return Err(Error::invalid_data(format!(
+                "a DFS referral points at {target_addr}, which would need a new connection; \
+                 this client was built on a supplied transport and will not dial. Set \
+                 dfs_enabled=false, or resolve the referral and supply a connection to it."
+            )));
         }
 
         // Create new connection to target.
@@ -1761,12 +1823,76 @@ mod tests {
         assert_eq!(mock.sent_count(), 3);
     }
 
+    /// A client on a transport this crate did not dial.
+    async fn supplied_client(mock: &Arc<MockTransport>, config: ClientConfig) -> SmbClient {
+        mock.enable_auto_rewrite_msg_id();
+        queue_negotiate_and_session(mock, SessionId(1));
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        SmbClient::from_connection(config, conn).await.unwrap()
+    }
+
     #[tokio::test]
-    async fn from_connection_refuses_to_pretend_it_can_reconnect() {
-        // The reviver `auto_reconnect` installs dials `addr` over TCP, which
-        // is not where a supplied connection came from. Ignoring the flag
-        // would leave a caller believing in a recovery that cannot happen;
-        // honouring it would move the session onto a path they did not choose.
+    async fn an_explicit_reconnect_does_not_dial_off_a_supplied_transport() {
+        // `reconnect` installs a TCP reviver for any client that has none —
+        // which for a supplied connection is the very thing that must not
+        // happen. It dials `addr`, so a session on a tunnel comes back on the
+        // open internet, or on nothing at all.
+        let mock = Arc::new(MockTransport::new());
+        let mut client = supplied_client(&mock, mock_config()).await;
+
+        let refused = client.reconnect().await;
+
+        assert!(matches!(refused, Err(Error::InvalidData { .. })));
+        assert!(
+            !client.connection_mut().can_reconnect(),
+            "and no reviver was left armed behind the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dfs_referral_is_refused_rather_than_dialled() {
+        // A referral to another server is a second connection, and the only
+        // way this crate knows to make one is TCP to the address in the
+        // referral. Off a supplied transport that is the same problem again,
+        // reached by a different road.
+        let mock = Arc::new(MockTransport::new());
+        let mut client = supplied_client(&mock, mock_config()).await;
+
+        let refused = client.ensure_connection("elsewhere.example:445").await;
+
+        assert!(matches!(refused, Err(Error::InvalidData { .. })));
+    }
+
+    #[tokio::test]
+    async fn auto_reconnect_is_for_the_caller_to_arm_not_for_us_to_refuse() {
+        // Refusing the flag outright — which this did — switches off every
+        // auto-recovery path in the client, because `session_is_gone` gates on
+        // it. A caller who arms their own reviver is then still left with a
+        // client that never recovers. The flag is honoured; what is withheld
+        // is the TCP reviver.
+        let mock = Arc::new(MockTransport::new());
+        let mut config = mock_config();
+        config.auto_reconnect = true;
+
+        let mut client = supplied_client(&mock, config).await;
+
+        assert!(client.config().auto_reconnect, "the flag stands");
+        assert!(
+            !client.connection_mut().can_reconnect(),
+            "but nothing was armed on the caller's behalf"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_connection_needs_an_address_that_names_the_server() {
+        // `addr` is not only where `connect` dials. It becomes
+        // `primary_server`, which is what tree connects are attributed to and
+        // what a DFS referral's UNC is built from — so an empty one produces a
+        // malformed path much later and far away.
         let mock = Arc::new(MockTransport::new());
         let conn = Connection::from_transport(
             Box::new(mock.clone()),
@@ -1775,11 +1901,44 @@ mod tests {
         );
 
         let mut config = mock_config();
-        config.auto_reconnect = true;
+        config.addr = String::new();
 
-        let refused = SmbClient::from_connection(config, conn).await;
+        assert!(matches!(
+            SmbClient::from_connection(config, conn).await,
+            Err(Error::InvalidData { .. })
+        ));
+    }
 
-        assert!(matches!(refused, Err(Error::InvalidData { .. })));
+    #[tokio::test]
+    async fn an_already_negotiated_connection_keeps_what_it_negotiated() {
+        // Compression is settled during NEGOTIATE. On a connection that has
+        // already been through it, the config's answer arrives too late to
+        // mean anything, and pretending otherwise would leave a caller
+        // believing compression was off when every frame still uses it.
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        queue_negotiate_and_session(&mock, SessionId(11));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_compression_requested(true);
+        conn.negotiate().await.expect("negotiated by the caller");
+        let negotiated = conn.compression_enabled();
+
+        let mut config = mock_config();
+        config.compression = !negotiated;
+        let mut client = SmbClient::from_connection(config, conn)
+            .await
+            .expect("authenticated");
+
+        assert_eq!(
+            client.connection_mut().compression_enabled(),
+            negotiated,
+            "what the connection negotiated is what it uses"
+        );
     }
 
     #[tokio::test]
