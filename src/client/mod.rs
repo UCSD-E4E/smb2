@@ -258,6 +258,99 @@ impl SmbClient {
         })
     }
 
+    /// Build a client on a connection the caller opened.
+    ///
+    /// [`connect`](Self::connect) dials TCP, because dialling TCP is the only
+    /// thing it knows how to do. A connection built with
+    /// [`Connection::from_transport`] can run over anything that carries
+    /// bytes — a userspace TCP stack inside a VPN tunnel, an SSH channel, a
+    /// test harness — and this is how one of those becomes a client:
+    /// `connect` without the dial.
+    ///
+    /// NEGOTIATE is performed unless the connection has already been
+    /// negotiated, and the session is then authenticated from `config`. The
+    /// rest of `config` is used exactly as [`connect`](Self::connect) uses it,
+    /// `addr` included: it still names the server, which is what tree
+    /// connects are attributed to and what a DFS referral to another server is
+    /// compared against.
+    ///
+    /// # Reconnection stays with whoever owns the transport
+    ///
+    /// [`ClientConfig::auto_reconnect`] is **refused** here rather than
+    /// quietly ignored. The reviver it installs dials `config.addr` over TCP,
+    /// which is not where this connection came from — so armed on, say, a
+    /// tunnelled connection it either fails every revival, or succeeds and
+    /// moves the session onto a path the caller deliberately did not choose.
+    /// Neither is something to do behind their back.
+    ///
+    /// A supplied connection is revived by a supplied reviver: build one that
+    /// knows how to reopen whatever this was, and install it with
+    /// [`Connection::set_reviver`] before or after this call.
+    ///
+    /// ```no_run
+    /// # use smb2::{ClientConfig, SmbClient};
+    /// # use smb2::client::connection::Connection;
+    /// # async fn demo(
+    /// #     send: Box<dyn smb2::transport::TransportSend>,
+    /// #     receive: Box<dyn smb2::transport::TransportReceive>,
+    /// #     config: ClientConfig,
+    /// # ) -> smb2::error::Result<()> {
+    /// let conn = Connection::from_transport(send, receive, "nas.example");
+    /// let client = SmbClient::from_connection(config, conn).await?;
+    /// # let _ = client;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`Connection::from_transport`]: crate::client::connection::Connection::from_transport
+    /// [`Connection::set_reviver`]: crate::client::connection::Connection::set_reviver
+    pub async fn from_connection(config: ClientConfig, mut conn: Connection) -> Result<Self> {
+        if config.auto_reconnect {
+            return Err(Error::invalid_data(
+                "auto_reconnect cannot be used with a supplied connection: it dials `addr` \
+                 over TCP, which is not where this connection came from. Install a reviver \
+                 that knows how to reopen this transport with Connection::set_reviver.",
+            ));
+        }
+
+        conn.set_compression_requested(config.compression);
+
+        // A caller may have negotiated already — to look at the dialect before
+        // committing to the server, say. A second NEGOTIATE on a live
+        // connection is a protocol error, so this is a question worth asking
+        // rather than an assumption worth making.
+        if conn.params().is_none() {
+            conn.negotiate().await?;
+        }
+
+        let session = Session::setup(
+            &mut conn,
+            &config.username,
+            &config.password,
+            &config.domain,
+        )
+        .await?;
+
+        debug!(
+            "smb_client: authenticated on a supplied connection to {}, session_id={}, \
+             compression={}",
+            conn.server_name(),
+            session.session_id,
+            conn.compression_enabled()
+        );
+
+        let primary_server = config.addr.clone();
+        Ok(SmbClient {
+            config,
+            conn,
+            session: std::sync::Arc::new(session),
+            primary_server,
+            extra_connections: HashMap::new(),
+            dfs_resolver: DfsResolver::new(),
+            reconnects: AtomicU64::new(0),
+        })
+    }
+
     /// Connect using an existing connection and session (for testing).
     #[cfg(test)]
     pub(crate) fn from_parts(config: ClientConfig, conn: Connection, session: Session) -> Self {
@@ -1580,22 +1673,9 @@ mod tests {
         ));
     }
 
-    /// Create a mock-backed SmbClient without going through TCP.
-    async fn make_mock_client(mock: &Arc<MockTransport>, session_id: SessionId) -> SmbClient {
-        mock.enable_auto_rewrite_msg_id();
-        queue_negotiate_and_session(mock, session_id);
-
-        let mut conn = Connection::from_transport(
-            Box::new(mock.clone()),
-            Box::new(mock.clone()),
-            "test-server",
-        );
-
-        conn.negotiate().await.unwrap();
-
-        let session = Session::setup(&mut conn, "user", "pass", "").await.unwrap();
-
-        let config = ClientConfig {
+    /// The config the mock-backed tests authenticate with.
+    fn mock_config() -> ClientConfig {
+        ClientConfig {
             addr: "test-server:445".to_string(),
             timeout: Duration::from_secs(5),
             username: "user".to_string(),
@@ -1605,9 +1685,101 @@ mod tests {
             compression: true,
             dfs_enabled: true,
             dfs_target_overrides: std::collections::HashMap::new(),
-        };
+        }
+    }
 
-        SmbClient::from_parts(config, conn, session)
+    /// Create a mock-backed SmbClient without going through TCP.
+    ///
+    /// Written through [`SmbClient::from_connection`] on purpose: a transport
+    /// that is not TCP is exactly what this helper has always needed, so the
+    /// public path for it may as well be the one the suite leans on.
+    async fn make_mock_client(mock: &Arc<MockTransport>, session_id: SessionId) -> SmbClient {
+        mock.enable_auto_rewrite_msg_id();
+        queue_negotiate_and_session(mock, session_id);
+
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        SmbClient::from_connection(mock_config(), conn)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn from_connection_negotiates_and_authenticates_what_it_is_given() {
+        // The whole point: a transport nobody in this crate dialled. Here it
+        // is a mock; for a consumer it is whatever carries their bytes.
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        queue_negotiate_and_session(&mock, SessionId(0x5EED));
+
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        let client = SmbClient::from_connection(mock_config(), conn)
+            .await
+            .expect("negotiated and authenticated");
+
+        assert_eq!(client.session().session_id, SessionId(0x5EED));
+        assert_eq!(
+            client.params().expect("negotiated").dialect,
+            Dialect::Smb3_1_1
+        );
+    }
+
+    #[tokio::test]
+    async fn from_connection_does_not_negotiate_twice() {
+        // A caller who negotiated for themselves — to inspect the dialect
+        // before committing, say — hands over a connection that is already
+        // past that point. A second NEGOTIATE on a live connection is a
+        // protocol error, so the only safe thing is to notice.
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        queue_negotiate_and_session(&mock, SessionId(7));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.negotiate().await.expect("negotiated by the caller");
+
+        let client = SmbClient::from_connection(mock_config(), conn)
+            .await
+            .expect("authenticated on the connection as it was");
+
+        assert_eq!(client.session().session_id, SessionId(7));
+        // One NEGOTIATE and two SESSION_SETUPs, and no more: a second
+        // negotiate would have sent a fourth message and starved the queued
+        // responses.
+        assert_eq!(mock.sent_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn from_connection_refuses_to_pretend_it_can_reconnect() {
+        // The reviver `auto_reconnect` installs dials `addr` over TCP, which
+        // is not where a supplied connection came from. Ignoring the flag
+        // would leave a caller believing in a recovery that cannot happen;
+        // honouring it would move the session onto a path they did not choose.
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        let mut config = mock_config();
+        config.auto_reconnect = true;
+
+        let refused = SmbClient::from_connection(config, conn).await;
+
+        assert!(matches!(refused, Err(Error::InvalidData { .. })));
     }
 
     #[tokio::test]
