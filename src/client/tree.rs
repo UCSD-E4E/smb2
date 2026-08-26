@@ -37,10 +37,29 @@ use crate::Error;
 
 /// Maximum number of requests to keep in flight during pipelining.
 ///
-/// More than 32 in-flight requests creates diminishing returns and
-/// increases memory usage (buffering responses). 32 x 64 KB = 2 MB
-/// in flight is plenty for Gigabit LAN.
+/// Ceiling on in-flight requests, on top of [`MAX_PIPELINE_BYTES`].
+///
+/// This used to be the whole bound, justified as "32 x 64 KB = 2 MB in flight
+/// is plenty for Gigabit LAN" — correct for a 64 KB chunk and wrong by sixteen
+/// times for the 1 MiB a Synology negotiates, where the same 32 became 32 MB.
 const MAX_PIPELINE_WINDOW: usize = 32;
+
+/// How much read data may be waiting on the wire at once.
+///
+/// The real bound. A window counted in requests says nothing about what it
+/// costs, because a request is whatever `MaxReadSize` happens to be — and the
+/// queue it sits in is the one FIFO every command shares, so its depth is the
+/// delay on a CREATE or a QUERY_INFO issued alongside it.
+const MAX_PIPELINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many chunks may be in flight, given what a chunk costs.
+///
+/// Never below two: one request on the wire and one behind it is what keeps the
+/// socket from going idle between chunks.
+fn pipeline_window(chunk_size: u32) -> usize {
+    let chunks = MAX_PIPELINE_BYTES / (chunk_size as usize).max(1);
+    chunks.clamp(2, MAX_PIPELINE_WINDOW)
+}
 
 /// Unwrap an `execute_compound` result, propagating the first inner
 /// waiter-level error (session expired, signature verify failure,
@@ -2649,7 +2668,7 @@ impl Tree {
         // allows: `Connection` reserves credits per send and parks a request
         // that can't afford one, so throttling here as well could only
         // under-send.
-        let initial_window = total_chunks.min(MAX_PIPELINE_WINDOW);
+        let initial_window = total_chunks.min(pipeline_window(chunk_size));
 
         trace!(
             "tree: pipeline read sliding window: initial_window={}, total_chunks={}, credits={}",
@@ -2770,7 +2789,7 @@ impl Tree {
         // allows: `Connection` reserves credits per send and parks a request
         // that can't afford one, so throttling here as well could only
         // under-send.
-        let initial_window = total_chunks.min(MAX_PIPELINE_WINDOW);
+        let initial_window = total_chunks.min(pipeline_window(chunk_size));
 
         let mut in_flight = FuturesUnordered::new();
         let build_req = |chunk_index: usize| -> ReadRequest {
@@ -2882,7 +2901,7 @@ impl Tree {
         // allows: `Connection` reserves credits per send and parks a request
         // that can't afford one, so throttling here as well could only
         // under-send.
-        let initial_window = total_chunks.min(MAX_PIPELINE_WINDOW);
+        let initial_window = total_chunks.min(pipeline_window(chunk_size));
 
         trace!(
             "tree: pipeline write sliding window: initial_window={}, total_chunks={}, credits={}",
@@ -3046,7 +3065,7 @@ impl Tree {
         // queue bound, not a credit bound — `Connection` reserves credits per
         // send and parks a write that can't afford one, so a chunk pulled from
         // the callback is always eventually sent.
-        while in_flight < MAX_PIPELINE_WINDOW {
+        while in_flight < pipeline_window(max_write) {
             let chunk = next_wire_chunk(
                 &mut pending_data,
                 &mut pending_offset,
@@ -3364,6 +3383,57 @@ fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
     }
 
     Ok(entries)
+}
+
+#[cfg(test)]
+mod pipeline_window_tests {
+    use super::{pipeline_window, MAX_PIPELINE_BYTES, MAX_PIPELINE_WINDOW};
+
+    /// What the window costs must not depend on what the server picked for a
+    /// chunk. It did: the count was fixed, so the bytes behind it scaled with
+    /// `MaxReadSize`/`MaxWriteSize` and nobody was counting them.
+    ///
+    /// The bound is the budget, except where a single chunk already exceeds it
+    /// — there the floor of two wins on purpose, since a window of one waits a
+    /// round trip between chunks.
+    #[test]
+    fn the_queue_holds_the_same_bytes_whatever_a_chunk_costs() {
+        for chunk in [64 * 1024u32, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024] {
+            let queued = pipeline_window(chunk) * chunk as usize;
+            let allowed = MAX_PIPELINE_BYTES.max(2 * chunk as usize);
+            assert!(
+                queued <= allowed,
+                "a {chunk}-byte chunk queues {queued} bytes, over the {allowed}-byte bound",
+            );
+        }
+    }
+
+    /// The case the whole change is about: a Synology negotiates 1 MiB, which
+    /// used to mean 32 MiB of one FIFO that every command shares.
+    #[test]
+    fn a_synology_sized_chunk_no_longer_queues_thirty_two_megabytes() {
+        let chunk = 1024 * 1024;
+        let before = MAX_PIPELINE_WINDOW * chunk;
+        let after = pipeline_window(chunk as u32) * chunk;
+        assert_eq!(before, 32 * 1024 * 1024);
+        assert_eq!(after, MAX_PIPELINE_BYTES);
+    }
+
+    /// The 64 KiB floor is what the old fixed window was sized for, so it is
+    /// the case that must not change.
+    #[test]
+    fn a_small_chunk_keeps_the_window_it_had() {
+        assert_eq!(pipeline_window(64 * 1024), MAX_PIPELINE_WINDOW);
+    }
+
+    /// One frame on the wire and one behind it, even when a single chunk is
+    /// bigger than the whole budget — otherwise the socket idles between
+    /// chunks, or worse, nothing can be sent at all.
+    #[test]
+    fn there_is_always_room_for_a_second_chunk() {
+        assert_eq!(pipeline_window(u32::MAX), 2);
+        assert_eq!(pipeline_window(0), MAX_PIPELINE_WINDOW);
+    }
 }
 
 #[cfg(test)]
