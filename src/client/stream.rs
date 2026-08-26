@@ -22,9 +22,29 @@ use crate::types::status::NtStatus;
 use crate::types::{Command, FileId};
 use crate::Error;
 
-/// Maximum number of pipelined write requests in flight.
+/// Ceiling on the number of pipelined write requests in flight.
 /// Matches `MAX_PIPELINE_WINDOW` in `tree.rs`.
 const MAX_PIPELINE_WINDOW: usize = 32;
+
+/// How much write data may be waiting on the wire at once.
+///
+/// The real bound, with [`MAX_PIPELINE_WINDOW`] left as a ceiling on top of it.
+/// A window counted in frames says nothing about what it costs, because a frame
+/// is whatever the server's `MaxWriteSize` happens to be: 32 frames is 2 MB
+/// against the 64 KiB floor and 32 MB against a Synology's 1 MiB.
+///
+/// Those 32 MB sat in the one FIFO every command shares, so on a link doing
+/// 2 MB/s a 132-byte CREATE waited 14.8 s and a 113-byte READ waited 20.4 s
+/// behind a copy — each about 120 ms of actual writing. The mount was frozen
+/// for as long as a transfer ran.
+///
+/// It bought no throughput to be there. `writer_loop` sends one frame at a
+/// time, so the socket stays saturated as long as the next frame is queued
+/// behind the one going out; depth past that is latency and nothing else. Four
+/// megabytes covers the bandwidth-delay product with room to spare at both ends
+/// of the range this client sees — ~2 s of work on a slow tunnel, ~40 ms on a
+/// LAN — while cutting what a small command can be stuck behind by eight times.
+const MAX_PIPELINE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Progress information for a file transfer.
 #[derive(Debug, Clone, Copy)]
@@ -1177,7 +1197,18 @@ impl FileWriter {
     /// and parks a write that can't afford one, so second-guessing it here
     /// could only stall a chunk that the connection would have sent.
     fn can_send(&self, _data: &[u8]) -> bool {
-        self.in_flight.len() < MAX_PIPELINE_WINDOW
+        self.in_flight.len() < self.window()
+    }
+
+    /// How many frames may be in flight, given what a frame costs here.
+    ///
+    /// Derived from [`MAX_PIPELINE_BYTES`] rather than fixed, so the queue holds
+    /// the same number of *bytes* whatever `MaxWriteSize` the server negotiated.
+    /// Never below two — one frame on the wire and one behind it is what keeps
+    /// the socket from going idle between frames.
+    fn window(&self) -> usize {
+        let frames = MAX_PIPELINE_BYTES / (self.max_write_size as usize).max(1);
+        frames.clamp(2, MAX_PIPELINE_WINDOW)
     }
 
     /// Try to send a wire chunk. If the window is full or credits are exhausted,
@@ -1185,7 +1216,7 @@ impl FileWriter {
     /// `Ok(false)` (caller decides whether to wait or return).
     async fn send_or_stash(&mut self, data: Vec<u8>) -> Result<bool> {
         // Make room if the window is full.
-        if self.in_flight.len() >= MAX_PIPELINE_WINDOW {
+        if self.in_flight.len() >= self.window() {
             self.drain_one().await?;
         }
 
@@ -1509,6 +1540,51 @@ mod tests {
 
         let total = writer.finish().await.unwrap();
         assert_eq!(total, (MAX_PIPELINE_WINDOW as u64 + 1) * 64);
+    }
+
+    /// The window bounds frames, and a frame is whatever the server's
+    /// `MaxWriteSize` says — so its cost in queued bytes was never bounded at
+    /// all.
+    ///
+    /// Against a Synology negotiating a 1 MiB `MaxWriteSize`, 32 frames is 32 MB
+    /// sitting in one FIFO that every command shares. Over a link doing 2 MB/s
+    /// that is sixteen seconds, and it was measured: a 132-byte CREATE waited
+    /// 14.8 s and a 113-byte READ waited 20.4 s behind a copy, each spending
+    /// ~120 ms actually on the wire. The mount looked frozen for as long as a
+    /// copy ran.
+    ///
+    /// The depth bought nothing. `writer_loop` sends one frame at a time, so
+    /// the socket stays saturated as long as the next frame is queued behind
+    /// the current one; everything past that is latency for other commands.
+    #[tokio::test]
+    async fn a_big_frame_size_does_not_mean_a_big_queue() {
+        const MIB: usize = 1024 * 1024;
+
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        mock.queue_response(build_create_response(file_id, 0));
+        for _ in 0..16 {
+            mock.queue_response(build_write_response(MIB as u32));
+        }
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let conn = crate::client::test_helpers::setup_connection_with_write_size(&mock, MIB as u32);
+        let tree = test_tree();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
+
+        // Six megabytes, one frame each. A window measured in bytes has to have
+        // drained by now; one measured in frames has thirty-two to fill first.
+        for _ in 0..6 {
+            writer.write_chunk(&vec![0u8; MIB]).await.unwrap();
+        }
+
+        assert!(
+            writer.bytes_written() > 0,
+            "6 MiB went out with nothing drained — the queue is bounded by \
+             frame count, so it holds {} MiB before it pushes back",
+            (MAX_PIPELINE_WINDOW * MIB) / MIB,
+        );
     }
 
     #[tokio::test]

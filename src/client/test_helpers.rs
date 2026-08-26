@@ -32,6 +32,16 @@ pub(crate) fn build_set_info_response() -> Vec<u8> {
 /// pending sent msg_id in FIFO order. Replaces the pre-Phase-3
 /// `set_orphan_filter_enabled(false)` path.
 pub(crate) fn setup_connection(mock: &Arc<MockTransport>) -> Connection {
+    setup_connection_with_write_size(mock, 65536)
+}
+
+/// The same, with the server's `MaxWriteSize` chosen by the caller — so a test
+/// can have the frame size a real Synology negotiates (1 MiB) rather than the
+/// 64 KiB floor.
+pub(crate) fn setup_connection_with_write_size(
+    mock: &Arc<MockTransport>,
+    max_write_size: u32,
+) -> Connection {
     mock.enable_auto_rewrite_msg_id();
     let mut conn = Connection::from_transport(
         Box::new(mock.clone()),
@@ -41,7 +51,7 @@ pub(crate) fn setup_connection(mock: &Arc<MockTransport>) -> Connection {
     conn.set_test_params(NegotiatedParams {
         dialect: Dialect::Smb2_0_2,
         max_read_size: 65536,
-        max_write_size: 65536,
+        max_write_size,
         max_transact_size: 65536,
         server_guid: Guid::ZERO,
         signing_required: false,
