@@ -626,6 +626,26 @@ impl SmbClient {
         &mut self.conn
     }
 
+    /// A clone of the connection that owns `tree`, or `None` if this client
+    /// holds no connection to the tree's server.
+    ///
+    /// For running [`Tree`] operations without holding the client: a
+    /// `Connection` is a cheap `Arc` clone that routes responses by message id,
+    /// so concurrent operations on it need no lock. [`connection_mut`] is the
+    /// primary connection, which is the wrong one for a tree a DFS referral
+    /// moved to another server.
+    ///
+    /// [`connection_mut`]: Self::connection_mut
+    pub fn connection_for(&self, tree: &Tree) -> Option<Connection> {
+        if tree.server == self.primary_server {
+            Some(self.conn.clone())
+        } else {
+            self.extra_connections
+                .get(&tree.server)
+                .map(|entry| entry.conn.clone())
+        }
+    }
+
     /// Get a mutable reference to the connection that owns the given tree.
     ///
     /// Routes through the primary connection when the tree's server matches,
@@ -1768,6 +1788,35 @@ mod tests {
         SmbClient::from_connection(mock_config(), conn)
             .await
             .unwrap()
+    }
+
+    fn tree_on(server: &str) -> Tree {
+        Tree {
+            tree_id: crate::types::TreeId(7),
+            share_name: "share".to_string(),
+            server: server.to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_for_hands_out_the_connection_that_owns_a_tree() {
+        // A consumer that runs `Tree` operations off its own lock needs the
+        // connection the tree belongs to. The primary one is wrong for a tree a
+        // DFS referral moved to another server, and `connection_mut` cannot
+        // tell the difference.
+        let mock = Arc::new(MockTransport::new());
+        let client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        let primary = client
+            .connection_for(&tree_on("test-server:445"))
+            .expect("a tree on the primary server");
+        assert_eq!(primary.server_name(), client.conn.server_name());
+        assert!(
+            client.connection_for(&tree_on("elsewhere:445")).is_none(),
+            "no connection to a server this client never reached"
+        );
     }
 
     #[tokio::test]
