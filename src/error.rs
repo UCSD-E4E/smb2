@@ -263,6 +263,34 @@ pub enum Error {
         /// How long since the server last put any frame on the wire.
         silent_for: std::time::Duration,
     },
+
+    /// A directory listing got back a name it had already returned, so the
+    /// server's enumeration had started over or was repeating.
+    ///
+    /// A directory cannot hold one name twice, so a repeat means the listing
+    /// would never reach `STATUS_NO_MORE_FILES` or would come back with
+    /// duplicates. One listing of a ~1.3M-entry directory on a Synology ran
+    /// for 77 minutes and more than five times the directory's size before
+    /// this check existed. The handle is closed before this is returned.
+    ///
+    /// The connection is fine: every request in the listing was answered.
+    /// So this classifies as [`ErrorKind::InvalidData`], never
+    /// `ConnectionLost`, and a consumer must not tear the session down over
+    /// it. Not retryable either, because the crate cannot know that asking
+    /// again will not repeat the same way; whether to list again is the
+    /// caller's call.
+    #[error(
+        "directory enumeration repeated: {name:?} came back a second time \
+         after {entries} entries in {pages} pages"
+    )]
+    DirectoryEnumerationRepeated {
+        /// The name that came back twice.
+        name: String,
+        /// Entries received before the repeat, the repeated one excluded.
+        entries: usize,
+        /// QUERY_DIRECTORY pages received, the one holding the repeat included.
+        pages: usize,
+    },
 }
 
 impl Error {
@@ -461,6 +489,8 @@ impl Error {
             // consumer that wants to explain why.
             Error::ReconnectFailed { .. } => ErrorKind::ConnectionLost,
             Error::DurableHandleLost { .. } => ErrorKind::ConnectionLost,
+            // The server answered every request; what it said does not add up.
+            Error::DirectoryEnumerationRepeated { .. } => ErrorKind::InvalidData,
             Error::Protocol { status, .. } => classify_status(*status),
         }
     }
@@ -668,6 +698,24 @@ mod tests {
     fn kind_disconnected_is_connection_lost() {
         // Error::Disconnected (transport EOF) IS a connection loss.
         assert_eq!(Error::Disconnected.kind(), ErrorKind::ConnectionLost);
+    }
+
+    #[test]
+    fn a_repeating_enumeration_does_not_read_as_a_lost_connection() {
+        // The link answered every page, so nothing may tear the session down
+        // over this.
+        let err = Error::DirectoryEnumerationRepeated {
+            name: "a.orf".to_string(),
+            entries: 1_300_000,
+            pages: 2_551,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(!err.is_retryable());
+        assert_eq!(
+            err.to_string(),
+            "directory enumeration repeated: \"a.orf\" came back a second time \
+             after 1300000 entries in 2551 pages"
+        );
     }
 
     #[test]

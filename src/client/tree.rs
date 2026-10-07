@@ -4,6 +4,7 @@
 //! It provides methods for directory listing, file reading/writing, deletion,
 //! renaming, stat, and directory creation.
 
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -366,7 +367,11 @@ impl Tree {
         let file_id = self.open_directory(conn, path).await?;
 
         // Query directory entries.
-        let result = self.query_directory_loop(conn, file_id).await;
+        let buffer_len = Self::default_query_buffer_len(conn);
+        let result = self
+            .query_directory_pages(conn, file_id, path, buffer_len)
+            .await
+            .map(|(entries, _)| entries);
 
         // Close the handle regardless of query result.
         let close_result = self.close_handle(conn, file_id).await;
@@ -402,44 +407,16 @@ impl Tree {
         let file_id = self.open_directory(conn, path).await?;
         let create = create_start.elapsed();
 
-        let mut queries = Vec::new();
-        let mut all_entries = Vec::new();
-        let mut restart = true;
-        let query_result = loop {
-            let step_start = Instant::now();
-            match self
-                .query_directory_step(conn, file_id, restart, buffer_len)
-                .await
-            {
-                Ok(QueryStepOutcome::Entries { entries, bytes }) => {
-                    queries.push(QueryStep {
-                        elapsed: step_start.elapsed(),
-                        entries: entries.len(),
-                        bytes,
-                        no_more_files: false,
-                    });
-                    all_entries.extend(entries);
-                }
-                Ok(QueryStepOutcome::NoMoreFiles { bytes }) => {
-                    queries.push(QueryStep {
-                        elapsed: step_start.elapsed(),
-                        entries: 0,
-                        bytes,
-                        no_more_files: true,
-                    });
-                    break Ok(());
-                }
-                Err(e) => break Err(e),
-            }
-            restart = false;
-        };
+        let query_result = self
+            .query_directory_pages(conn, file_id, path, buffer_len)
+            .await;
 
         // Close the handle regardless of query result, mirroring `list_directory`.
         let close_start = Instant::now();
         let close_result = self.close_handle(conn, file_id).await;
         let close = close_start.elapsed();
 
-        query_result?;
+        let (all_entries, queries) = query_result?;
         close_result?;
 
         let trace = ListingTrace {
@@ -2491,9 +2468,10 @@ impl Tree {
     /// Issue one QUERY_DIRECTORY round trip and parse its reply.
     ///
     /// The single-source of the CREATE-less half of a listing: both
-    /// [`query_directory_loop`](Self::query_directory_loop) and
+    /// [`list_directory`](Self::list_directory) and
     /// [`list_directory_instrumented`](Self::list_directory_instrumented) drive
-    /// this, so they always exercise the same wire request.
+    /// this through [`query_directory_pages`](Self::query_directory_pages), so
+    /// they always exercise the same wire request.
     ///
     /// `output_buffer_length` above 65536 needs a matching multi-credit charge;
     /// this computes it as ceil(len / 65536).
@@ -2558,27 +2536,74 @@ impl Tree {
         Ok(QueryStepOutcome::Entries { entries, bytes })
     }
 
-    async fn query_directory_loop(
+    /// Page through an open directory until STATUS_NO_MORE_FILES, returning
+    /// every entry and one [`QueryStep`] per round trip.
+    ///
+    /// No cap on pages, bytes or time: a correct listing of any size has to
+    /// come back whole, and each round trip already has its own deadline. What
+    /// it refuses is a name it has already returned. A directory cannot hold
+    /// one name twice, so a repeat means the server restarted or is repeating
+    /// the enumeration, and paging on would never end (a Synology once ran a
+    /// listing past five times its directory's size). Names are compared
+    /// exactly as returned: a repeating server sends the same bytes, and
+    /// case-folding would confuse distinct names on a case-sensitive share.
+    async fn query_directory_pages(
         &self,
         conn: &mut Connection,
         file_id: FileId,
-    ) -> Result<Vec<DirectoryEntry>> {
-        let output_buffer_length = Self::default_query_buffer_len(conn);
-        let mut all_entries = Vec::new();
+        path: &str,
+        output_buffer_length: u32,
+    ) -> Result<(Vec<DirectoryEntry>, Vec<QueryStep>)> {
+        let mut all_entries: Vec<DirectoryEntry> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut steps = Vec::new();
         let mut restart = true;
 
         loop {
-            match self
+            let step_start = Instant::now();
+            let (entries, bytes) = match self
                 .query_directory_step(conn, file_id, restart, output_buffer_length)
                 .await?
             {
-                QueryStepOutcome::NoMoreFiles { .. } => break,
-                QueryStepOutcome::Entries { entries, .. } => all_entries.extend(entries),
+                QueryStepOutcome::NoMoreFiles { bytes } => {
+                    steps.push(QueryStep {
+                        elapsed: step_start.elapsed(),
+                        entries: 0,
+                        bytes,
+                        no_more_files: true,
+                    });
+                    return Ok((all_entries, steps));
+                }
+                QueryStepOutcome::Entries { entries, bytes } => (entries, bytes),
+            };
+            steps.push(QueryStep {
+                elapsed: step_start.elapsed(),
+                entries: entries.len(),
+                bytes,
+                no_more_files: false,
+            });
+            for entry in entries {
+                if !seen.insert(entry.name.clone()) {
+                    warn!(
+                        "tree: directory enumeration repeated, stopping the listing: path={}, \
+                         file_id={:?}, name={:?} came back after {} entries in {} pages. The \
+                         server restarted or is repeating its enumeration; the connection is fine",
+                        path,
+                        file_id,
+                        entry.name,
+                        all_entries.len(),
+                        steps.len()
+                    );
+                    return Err(Error::DirectoryEnumerationRepeated {
+                        name: entry.name,
+                        entries: all_entries.len(),
+                        pages: steps.len(),
+                    });
+                }
+                all_entries.push(entry);
             }
             restart = false;
         }
-
-        Ok(all_entries)
     }
 
     /// Read file data in chunks.
@@ -3700,6 +3725,229 @@ mod tests {
             trace.total(),
             trace.create + trace.query_total() + trace.close
         );
+    }
+
+    /// One QUERY_DIRECTORY page holding `names`, chained the way a server
+    /// chains them.
+    fn build_dir_page(names: &[&str]) -> Vec<u8> {
+        let mut page = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            let last = i + 1 == names.len();
+            let len = build_file_both_dir_info(name, 1, false, 0).len() as u32;
+            page.extend(build_file_both_dir_info(
+                name,
+                1,
+                false,
+                if last { 0 } else { len },
+            ));
+        }
+        page
+    }
+
+    fn test_tree() -> Tree {
+        Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        }
+    }
+
+    /// What the server was asked, once the listing is over.
+    struct RepeatingServerLog {
+        queries: usize,
+        closed: bool,
+    }
+
+    /// Play a server whose enumeration starts over on every page: each
+    /// QUERY_DIRECTORY gets `page` again, the way the field incident looked
+    /// from the client. A real one never stops; this one gives up with
+    /// NO_MORE_FILES after `give_up_after` pages, so a client that does not
+    /// notice the repeat finishes (with duplicates) instead of hanging the
+    /// test.
+    async fn serve_repeating_directory(
+        mock: &MockTransport,
+        file_id: FileId,
+        page: Vec<u8>,
+        give_up_after: usize,
+    ) -> RepeatingServerLog {
+        let mut log = RepeatingServerLog {
+            queries: 0,
+            closed: false,
+        };
+        let mut answered = 0;
+        loop {
+            while mock.sent_count() > answered {
+                let sent = mock.sent_message(answered).unwrap();
+                answered += 1;
+                let header = Header::unpack(&mut ReadCursor::new(&sent)).unwrap();
+                match header.command {
+                    Command::Create => mock.queue_response(build_create_response(file_id, 0)),
+                    Command::QueryDirectory if log.queries < give_up_after => {
+                        log.queries += 1;
+                        mock.queue_response(build_query_directory_response(
+                            NtStatus::SUCCESS,
+                            page.clone(),
+                        ));
+                    }
+                    Command::QueryDirectory => {
+                        log.queries += 1;
+                        mock.queue_response(build_query_directory_response(
+                            NtStatus::NO_MORE_FILES,
+                            vec![],
+                        ));
+                    }
+                    Command::Close => {
+                        log.closed = true;
+                        mock.queue_response(build_close_response());
+                        return log;
+                    }
+                    other => panic!("unexpected {other:?} during a listing"),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The field incident: a listing of a ~1.3M-entry directory ran past five
+    /// times the directory's size without reaching NO_MORE_FILES. A real
+    /// directory cannot hold one name twice, so the second time a name comes
+    /// back the listing has to stop, close its handle, and say why.
+    #[tokio::test]
+    async fn list_directory_fails_when_the_enumeration_repeats() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+        let page = build_dir_page(&[".", "..", "a.orf", "b.orf"]);
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let (result, server) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                tree.list_directory(&mut conn, "raw"),
+                serve_repeating_directory(&mock, file_id, page, 50),
+            )
+        })
+        .await
+        .expect("the listing never finished");
+
+        match result {
+            Err(Error::DirectoryEnumerationRepeated {
+                name,
+                entries,
+                pages,
+            }) => {
+                assert_eq!(name, ".");
+                assert_eq!(entries, 4);
+                assert_eq!(pages, 2);
+            }
+            other => panic!("expected DirectoryEnumerationRepeated, got {other:?}"),
+        }
+        // Stopped on the page that repeated, not one later.
+        assert_eq!(server.queries, 2);
+        assert!(server.closed, "the directory handle was never closed");
+    }
+
+    #[tokio::test]
+    async fn list_directory_instrumented_fails_when_the_enumeration_repeats() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+        // No dot entries this time, so the repeat is caught on a real name.
+        let page = build_dir_page(&["a.orf", "b.orf", "c.orf"]);
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let (result, server) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                tree.list_directory_instrumented(&mut conn, "raw", None),
+                serve_repeating_directory(&mock, file_id, page, 50),
+            )
+        })
+        .await
+        .expect("the listing never finished");
+
+        match result {
+            Err(Error::DirectoryEnumerationRepeated {
+                name,
+                entries,
+                pages,
+            }) => {
+                assert_eq!(name, "a.orf");
+                assert_eq!(entries, 3);
+                assert_eq!(pages, 2);
+            }
+            other => panic!("expected DirectoryEnumerationRepeated, got {other:?}"),
+        }
+        assert_eq!(server.queries, 2);
+        assert!(server.closed, "the directory handle was never closed");
+    }
+
+    /// The guard must not cost a correct listing anything: distinct names
+    /// across several pages all come back, in order.
+    #[tokio::test]
+    async fn list_directory_returns_every_entry_across_pages() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+        mock.queue_response(build_create_response(file_id, 0));
+        for names in [&[".", "..", "a"][..], &["b", "c"], &["d"]] {
+            mock.queue_response(build_query_directory_response(
+                NtStatus::SUCCESS,
+                build_dir_page(names),
+            ));
+        }
+        mock.queue_response(build_query_directory_response(
+            NtStatus::NO_MORE_FILES,
+            vec![],
+        ));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+        let entries = tree.list_directory(&mut conn, "raw").await.unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, [".", "..", "a", "b", "c", "d"]);
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn list_directory_instrumented_returns_every_entry_across_pages() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+        mock.queue_response(build_create_response(file_id, 0));
+        for names in [&["a", "b"][..], &["c"]] {
+            mock.queue_response(build_query_directory_response(
+                NtStatus::SUCCESS,
+                build_dir_page(names),
+            ));
+        }
+        mock.queue_response(build_query_directory_response(
+            NtStatus::NO_MORE_FILES,
+            vec![],
+        ));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+        let (entries, trace) = tree
+            .list_directory_instrumented(&mut conn, "raw", None)
+            .await
+            .unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(trace.queries.len(), 3);
+        mock.assert_fully_consumed();
     }
 
     #[tokio::test]
